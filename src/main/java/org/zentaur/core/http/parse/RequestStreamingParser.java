@@ -1,0 +1,420 @@
+package org.zentaur.core.http.parse;
+
+/*
+ *   Copyright 2012 The Zentaur Server Project
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ */
+
+import static org.zentaur.core.http.parse.ParserStatus.BODY_CONSUMING;
+import static org.zentaur.core.http.parse.ParserStatus.COMPLETE;
+import static org.zentaur.core.http.parse.ParserStatus.COOKIE_NAME;
+import static org.zentaur.core.http.parse.ParserStatus.COOKIE_VALUE;
+import static org.zentaur.core.http.parse.ParserStatus.HEADER_NAME;
+import static org.zentaur.core.http.parse.ParserStatus.HEADER_USER_AGENT_VALUE;
+import static org.zentaur.core.http.parse.ParserStatus.HEADER_VALUE;
+import static org.zentaur.core.http.parse.ParserStatus.METHOD;
+import static org.zentaur.core.http.parse.ParserStatus.PARAM_NAME;
+import static org.zentaur.core.http.parse.ParserStatus.PARAM_VALUE;
+import static org.zentaur.core.http.parse.ParserStatus.PATH;
+import static org.zentaur.core.http.parse.ParserStatus.PROTOCOL_NAME;
+import static org.zentaur.core.http.parse.ParserStatus.PROTOCOL_VERSION;
+import static org.zentaur.core.http.parse.ParserStatus.QS_PARAM_NAME;
+import static org.zentaur.core.http.parse.ParserStatus.QS_PARAM_VALUE;
+import static org.zentaur.core.io.IOUtils.toUtf8CharBuffer;
+import static org.zentaur.http.Headers.CONTENT_TYPE;
+import static org.slf4j.LoggerFactory.getLogger;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.util.EnumMap;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Queue;
+
+import org.zentaur.core.http.MutableRequest;
+import org.zentaur.core.http.RequestParseException;
+import org.zentaur.core.io.ByteBufferEnqueuerOutputStream;
+import org.zentaur.http.Request;
+import org.slf4j.Logger;
+
+/**
+ * An LL(0) {@link Request} pull parser that incrementally rebuilds the HTTP Request.
+ *
+ * This class is not thread-safe!
+ */
+public final class RequestStreamingParser
+{
+
+    private static final Logger logger = getLogger( RequestStreamingParser.class );
+
+    private static final char CARRIAGE_RETURN = '\r';
+
+    private static final char NEW_LINE = '\n';
+
+    private static final char TOKEN_SEPARATOR = ' ';
+
+    private static final char HEADER_SEPARATOR = ';';
+
+    private static final char QUERY_STRING_SEPARATOR = '?';
+
+    private static final char PARAMETER_SEPARATOR = '&';
+
+    private static final char KEY_VALUE_SEPARATOR = '=';
+
+    private static final char PROTOCOL_VERSION_SEPARATOR = '/';
+
+    private static final char HEADER_NAME_SEPARATOR = ':';
+
+    private static final char HEADER_VALUES_SEPARATOR = ',';
+
+    private static final String FORM_URLENCODED = "application/x-www-form-urlencoded";
+
+    private final MutableRequest request = new MutableRequest();
+
+    private final Map<ParserStatus, ParserTrigger> parserTriggers = new EnumMap<ParserStatus, ParserTrigger>( ParserStatus.class );
+
+    private StringBuilder accumulator = new StringBuilder();
+
+    private ParserStatus status = ParserStatus.METHOD;
+
+    /**
+     * Used only when when method == POST and Content-Type == application/x-www-form-urlencoded
+     */
+    private long bodyConsumingCounter = -1; // -1 because the first will be triggered by \n
+
+    private final Queue<ByteBuffer> requestBody = new LinkedList<ByteBuffer>();
+
+    private ByteBufferEnqueuerOutputStream bodyConsumerOutputStream;
+
+    /**
+     * Creates a new parser instance, which will provide a {@link Request} objects
+     * from the textual representation, initialized with construcotr arguments.
+     *
+     * @param clientHost the client with sent the request.
+     * @param serverHost the running server host
+     * @param serverPort the running server port
+     */
+    public RequestStreamingParser( String clientHost, String serverHost, int serverPort )
+    {
+        request.setClientHost( clientHost );
+        request.setServerHost( serverHost );
+        request.setServerPort( serverPort );
+
+        registerTrigger( new MethodParserTrigger(), METHOD );
+        registerTrigger( new PathParserTrigger(), PATH );
+        registerTrigger( new ProtocolNameParserTrigger(), PROTOCOL_NAME );
+        registerTrigger( new ProtocolVersionParserTrigger(), PROTOCOL_VERSION );
+        registerTrigger( new QueryStringParametersParserTrigger(), QS_PARAM_NAME, QS_PARAM_VALUE );
+        registerTrigger( new HeaderParserTrigger(), HEADER_NAME, HEADER_VALUE, HEADER_USER_AGENT_VALUE, COOKIE_VALUE );
+        registerTrigger( new CookieParserTrigger(), COOKIE_NAME, COOKIE_VALUE );
+        registerTrigger( new ParametersParserTrigger(), PARAM_NAME, PARAM_VALUE );
+    }
+
+    private void registerTrigger( ParserTrigger trigger, ParserStatus...parserStatuses )
+    {
+        for ( ParserStatus parserStatus : parserStatuses )
+        {
+            parserTriggers.put( parserStatus, trigger );
+        }
+    }
+
+    /**
+     * Invoked as soon as the server receives a chunk of the request.
+     *
+     * @param messageBuffer the buffer containing the request chunk
+     * @throws RequestParseException if any parse error occurs
+     */
+    public void onRequestPartRead( ByteBuffer messageBuffer )
+        throws RequestParseException
+    {
+        if ( isRequestMessageComplete() )
+        {
+            return;
+        }
+
+        if ( BODY_CONSUMING == status )
+        {
+            consumeBody( messageBuffer );
+        }
+        else
+        {
+            CharBuffer charBuffer = toUtf8CharBuffer( messageBuffer );
+            dance: while ( charBuffer.hasRemaining() )
+            {
+                char current = charBuffer.get();
+
+                if ( logger.isDebugEnabled() )
+                {
+                    logger.debug( "{} consuming char: `{}'", status, current );
+                }
+
+                if ( isRequestMessageComplete() )
+                {
+                    break dance;
+                }
+
+                switch ( current )
+                {
+                    case CARRIAGE_RETURN:
+                        break;
+
+                    case TOKEN_SEPARATOR:
+                        if ( !isConsumingToken() ) // trim initial spaces
+                        {
+                            break;
+                        }
+
+                        if ( HEADER_VALUE == status
+                             || HEADER_USER_AGENT_VALUE == status
+                             || COOKIE_VALUE == status )
+                        {
+                            append( current );
+                        }
+                        else
+                        {
+                            tokenFound();
+                            if ( QS_PARAM_NAME == status )
+                            {
+                                forceSwitch( current, PROTOCOL_NAME );
+                            }
+                        }
+                        break;
+
+                    case PROTOCOL_VERSION_SEPARATOR:
+                        if ( PROTOCOL_NAME == status )
+                        {
+                            tokenFound();
+                        }
+                        else
+                        {
+                            append( current );
+                        }
+                        break;
+
+                    case KEY_VALUE_SEPARATOR:
+                        if ( HEADER_VALUE == status || COOKIE_VALUE == status )
+                        {
+                            append( current );
+                        }
+                        else
+                        {
+                            tokenFound();
+                        }
+                        break;
+
+                    case HEADER_NAME_SEPARATOR:
+                        if ( HEADER_VALUE == status )
+                        {
+                            append( current );
+                        }
+                        else
+                        {
+                            tokenFound();
+                        }
+                        break;
+
+                    case HEADER_VALUES_SEPARATOR:
+                        if ( HEADER_USER_AGENT_VALUE == status || COOKIE_VALUE == status )
+                        {
+                            append( current );
+                        }
+                        else
+                        {
+                            tokenFound();
+                        }
+                        break;
+
+                    case PARAMETER_SEPARATOR:
+                        tokenFound();
+                        break;
+
+                    case QUERY_STRING_SEPARATOR:
+                        tokenFound();
+                        forceSwitch( current, QS_PARAM_NAME );
+                        break;
+
+                    case NEW_LINE:
+                        if ( isConsumingToken() )
+                        {
+                            tokenFound();
+                            if ( HEADER_VALUE == status
+                                 || HEADER_USER_AGENT_VALUE == status
+                                 || COOKIE_VALUE == status )
+                            {
+                                forceSwitch( current, HEADER_NAME );
+                            }
+                        }
+                        else if ( request.getContentLength() > 0 )
+                        {
+                            if ( logger.isDebugEnabled() )
+                            {
+                                logger.debug( "Consuming request body of length {}", request.getContentLength() );
+                            }
+
+                            if ( request.getHeaders().contains( CONTENT_TYPE )
+                                 && request.getHeaders().getFirstValue( CONTENT_TYPE ).contains( FORM_URLENCODED ) )
+                            {
+                                forceSwitch( current, PARAM_NAME );
+                            }
+                            else
+                            {
+                                forceSwitch( current, BODY_CONSUMING );
+
+                                messageBuffer.position( charBuffer.position() );
+
+                                consumeBody( messageBuffer );
+                                break dance;
+                            }
+                        }
+                        else
+                        {
+                            status = COMPLETE;
+                        }
+                        break;
+
+                    case HEADER_SEPARATOR:
+                        if ( HEADER_VALUE == status || HEADER_USER_AGENT_VALUE == status )
+                        {
+                            append( current );
+                        }
+                        else
+                        {
+                            tokenFound();
+                        }
+                        break;
+
+                    default:
+                        append( current );
+                        break;
+                }
+
+                if ( PARAM_NAME == status || PARAM_VALUE == status )
+                {
+                    bodyConsumingCounter++;
+
+                    if ( PARAM_VALUE == status && request.getContentLength() == bodyConsumingCounter )
+                    {
+                        tokenFound();
+                        status = COMPLETE;
+
+                        if ( logger.isDebugEnabled() )
+                        {
+                            logger.debug( "Request body consumed" );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void forceSwitch( char trigger, ParserStatus newStatus )
+    {
+        if ( logger.isDebugEnabled() )
+        {
+            logger.debug( "{} trigger char: `{}' -> next status {}", new Object[] { status, trigger, newStatus } );
+        }
+        status = newStatus;
+    }
+
+    private boolean isConsumingToken()
+    {
+        return accumulator.length() > 0;
+    }
+
+    private void append( char current )
+    {
+        accumulator.append( current );
+    }
+
+    private void tokenFound()
+        throws RequestParseException
+    {
+        String token = accumulator.toString();
+        ParserStatus newStatus = parserTriggers.get( status ).onToken( status, token, request );
+
+        if ( logger.isDebugEnabled() )
+        {
+            logger.debug( "{} consuming token: `{}' -> next status {}", new Object[] { status, token, newStatus } );
+        }
+
+        accumulator = new StringBuilder();
+        status = newStatus;
+    }
+
+    private void consumeBody( ByteBuffer buffer )
+        throws RequestParseException
+    {
+        // lazy load the body bytes consumer
+        if ( bodyConsumerOutputStream == null )
+        {
+            bodyConsumerOutputStream = new ByteBufferEnqueuerOutputStream( requestBody );
+        }
+
+        while ( buffer.hasRemaining() && bodyConsumerOutputStream.getWrittenBytes() <= request.getContentLength() )
+        {
+            try
+            {
+                bodyConsumerOutputStream.write( buffer.get() );
+            }
+            catch ( IOException e )
+            {
+                throw new RequestParseException( "An error occurred while consuming request body", e );
+            }
+        }
+
+        if ( request.getContentLength() == bodyConsumerOutputStream.getWrittenBytes() )
+        {
+            if ( logger.isDebugEnabled() )
+            {
+                logger.debug( "Request body consumed" );
+            }
+
+            status = COMPLETE;
+
+            try
+            {
+                bodyConsumerOutputStream.flush();
+                bodyConsumerOutputStream.close();
+            }
+            catch ( IOException ioe )
+            {
+                // nothing can happen here
+            }
+
+            request.setRequestBody( requestBody );
+        }
+    }
+
+    /**
+     * Verifies the request has been entirely processed.
+     *
+     * @return true, if the request has been entirely processed, false otherwise.
+     */
+    public boolean isRequestMessageComplete()
+    {
+        return COMPLETE == status;
+    }
+
+    /**
+     * Returns the parsed {@link Request} object from the textual representation.
+     *
+     * @return the parsed {@link Request} object from the textual representation.
+     */
+    public Request getParsedRequest()
+    {
+        return request;
+    }
+
+}
